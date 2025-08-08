@@ -109,18 +109,23 @@ func (mi *ModuleInstance) NewClient(call sobek.ConstructorCall) *sobek.Object {
 		managers[i] = manager
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	client := &Client{
-		vu:       mi.vu,
-		metrics:  mi.m,
-		thor:     thor,
-		wallet:   wa,
-		chainTag: chainTag,
-		opts:     opts,
-		accounts: opts.Accounts,
-		managers: managers,
+		vu:          mi.vu,
+		metrics:     mi.m,
+		thor:        thor,
+		wallet:      wa,
+		chainTag:    chainTag,
+		opts:        opts,
+		accounts:    opts.Accounts,
+		managers:    managers,
+		ctx:         ctx,
+		cancel:      cancel,
+		metricsChan: make(chan blockMetrics, 100),
 	}
 
 	go client.pollForBlocks()
+	go client.processMetrics()
 
 	return rt.ToValue(client).ToObject(rt)
 }
@@ -142,14 +147,17 @@ func registerMetrics(vu modules.VU) vechainMetrics {
 
 func (c *Client) reportMetricsFromStats(call string, t time.Duration) {
 	registry := metrics.NewRegistry()
-	metrics.PushIfNotDone(c.vu.Context(), c.vu.State().Samples, metrics.Sample{
-		TimeSeries: metrics.TimeSeries{
-			Metric: c.metrics.RequestDuration,
-			Tags:   registry.RootTagSet().With("call", call),
-		},
-		Value: float64(t / time.Millisecond),
-		Time:  time.Now(),
-	})
+
+	if c.vu != nil {
+		metrics.PushIfNotDone(c.vu.Context(), c.vu.State().Samples, metrics.Sample{
+			TimeSeries: metrics.TimeSeries{
+				Metric: c.metrics.RequestDuration,
+				Tags:   registry.RootTagSet().With("call", call),
+			},
+			Value: float64(t / time.Millisecond),
+			Time:  time.Now(),
+		})
+	}
 }
 
 // options defines configuration options for the client.

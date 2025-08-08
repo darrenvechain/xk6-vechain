@@ -1,11 +1,18 @@
-import vechain from "k6/x/vechain";
+import { check, sleep } from "k6";
 import http from "k6/http";
-import {sleep, check} from "k6";
+import vechain from "k6/x/vechain";
 
 const stages = [
     { target: 44, duration: "10s" },
-    { target: 44, duration: "10m" }
+    { target: 44, duration: "10m" },
+    { target: 0, duration: "1m" },
 ]
+
+function repeatStages(cycle, times) {
+    const out = [];
+    for (let i = 0; i < times; i++) out.push(...cycle);
+    return out;
+}
 
 export const options = {
     scenarios: {
@@ -18,7 +25,9 @@ export const options = {
             // Pre-allocate necessary VUs.
             preAllocatedVUs: 50,
             maxVUs: 50,
-            stages,
+            // Roughly 78 days running
+            stages: repeatStages(stages, 10000),
+            gracefulStop: '30s',
         },
     },
     tags: {

@@ -21,14 +21,30 @@ import (
 )
 
 type Client struct {
-	wallet   *hdwallet.Wallet
-	thor     *thorgo.Thor
-	chainTag byte
-	vu       modules.VU
-	metrics  vechainMetrics
-	opts     *options
-	accounts int
-	managers []*txmanager.PKManager
+	wallet         *hdwallet.Wallet
+	thor           *thorgo.Thor
+	chainTag       byte
+	vu             modules.VU
+	metrics        vechainMetrics
+	opts           *options
+	accounts       int
+	managers       []*txmanager.PKManager
+	ctx            context.Context
+	cancel         context.CancelFunc
+	metricsChan    chan blockMetrics
+	metricsMu      sync.Mutex
+	pendingMetrics []blockMetrics
+}
+
+type blockMetrics struct {
+	blockNumber    int64
+	transactions   int
+	gasUsed        int64
+	gasLimit       int64
+	tps            float64
+	blockTime      time.Duration
+	baseFeePercent float64
+	timestamp      time.Time
 }
 
 func (c *Client) Accounts() []string {
@@ -40,6 +56,8 @@ func (c *Client) Accounts() []string {
 }
 
 func (c *Client) DeployToolchain(amount int) ([]string, error) {
+	c.FlushMetrics()
+
 	contracts, err := toolchain.Deploy(c.thor, c.managers, amount)
 	if err != nil {
 		return nil, err
@@ -52,6 +70,8 @@ func (c *Client) DeployToolchain(amount int) ([]string, error) {
 }
 
 func (c *Client) NewToolchainTransaction(address string) (string, error) {
+	c.FlushMetrics()
+
 	addr := common.HexToAddress(address)
 	return toolchain.NewTransaction(c.thor, c.managers, addr)
 }
@@ -60,6 +80,8 @@ func (c *Client) NewToolchainTransaction(address string) (string, error) {
 // The amount is the amount of VET & VTHO to send, represented as hex.
 // Example: thor solo only funds the first 10 accounts [0-9], so specify 10 as the start index.
 func (c *Client) Fund(start int, amount string) error {
+	c.FlushMetrics()
+
 	if start > len(c.managers) {
 		return errors.New("start index is greater than the number of accounts")
 	}
@@ -153,74 +175,127 @@ func (c *Client) pollForBlocks() {
 
 			prev = block
 
-			rootTS := metrics.NewRegistry().RootTagSet()
-			if c.vu != nil && c.vu.State() != nil && rootTS != nil {
-				if _, loaded := blocks.LoadOrStore(c.opts.URL+strconv.FormatInt(block.Number, 10), true); loaded {
-					// We already have a block number for this client, so we can skip this
-					continue
-				}
+			if _, loaded := blocks.LoadOrStore(c.opts.URL+strconv.FormatInt(block.Number, 10), true); loaded {
+				// We already have a block number for this client, so we can skip this
+				continue
+			}
 
-				baseFee, _ := block.BaseFee.ToInt().Float64()
-				baseFeePercent := baseFee * 100 / 10_000_000_000_000
+			baseFee, _ := block.BaseFee.ToInt().Float64()
+			baseFeePercent := baseFee * 100 / 10_000_000_000_000
 
-				slog.Info("base fee", "val", baseFeePercent, "block", block.Number)
+			slog.Info("base fee", "val", baseFeePercent, "block", block.Number)
 
-				blockTime := time.Unix(block.Timestamp, 0)
-
-				metrics.PushIfNotDone(c.vu.Context(), c.vu.State().Samples, metrics.ConnectedSamples{
-					Samples: []metrics.Sample{
-						{
-							TimeSeries: metrics.TimeSeries{
-								Metric: c.metrics.Block,
-								Tags: rootTS.WithTagsFromMap(map[string]string{
-									"transactions": strconv.Itoa(len(block.Transactions)),
-									"gas_used":     strconv.Itoa(int(block.GasUsed)),
-									"gas_limit":    strconv.Itoa(int(block.GasLimit)),
-								}),
-							},
-							Value: float64(block.Number),
-							Time:  blockTime,
-						},
-						{
-							TimeSeries: metrics.TimeSeries{
-								Metric: c.metrics.GasUsed,
-								Tags:   rootTS,
-							},
-							Value: float64(block.GasUsed),
-							Time:  blockTime,
-						},
-						{
-							TimeSeries: metrics.TimeSeries{
-								Metric: c.metrics.TPS,
-								Tags:   rootTS,
-							},
-							Value: tps,
-							Time:  blockTime,
-						},
-						{
-							TimeSeries: metrics.TimeSeries{
-								Metric: c.metrics.BlockTime,
-								Tags: rootTS.WithTagsFromMap(map[string]string{
-									"block_timestamp_diff": blockTimestampDiff.String(),
-								}),
-							},
-							Value: float64(blockTimestampDiff.Milliseconds()),
-							Time:  blockTime,
-						},
-						{
-							TimeSeries: metrics.TimeSeries{
-								Metric: c.metrics.BaseFee,
-								Tags:   rootTS,
-							},
-							Value: baseFeePercent,
-							Time:  blockTime,
-							Metadata: map[string]string{
-								"block": strconv.Itoa(int(block.Number)),
-							},
-						},
-					},
-				})
+			select {
+			case c.metricsChan <- blockMetrics{
+				blockNumber:    block.Number,
+				transactions:   len(block.Transactions),
+				gasUsed:        block.GasUsed,
+				gasLimit:       block.GasLimit,
+				tps:            tps,
+				blockTime:      blockTimestampDiff,
+				baseFeePercent: baseFeePercent,
+				timestamp:      time.Unix(block.Timestamp, 0),
+			}:
+			default:
+				// Channel is full, skip this metric
+				slog.Warn("metrics channel full, skipping block metric")
 			}
 		}
 	}
+}
+
+// Close cancels the context
+func (c *Client) Close() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
+
+// processMetrics stores metrics in a channel for later processing
+func (c *Client) processMetrics() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case metric := <-c.metricsChan:
+			c.metricsMu.Lock()
+			c.pendingMetrics = append(c.pendingMetrics, metric)
+			c.metricsMu.Unlock()
+		}
+	}
+}
+
+// FlushMetrics sends all pending metrics to k6 (should be called from main thread)
+func (c *Client) FlushMetrics() {
+	c.metricsMu.Lock()
+	defer c.metricsMu.Unlock()
+
+	if len(c.pendingMetrics) == 0 || c.vu == nil || c.vu.State() == nil {
+		return
+	}
+
+	rootTS := metrics.NewRegistry().RootTagSet()
+	var samples []metrics.Sample
+
+	for _, metric := range c.pendingMetrics {
+		samples = append(samples, []metrics.Sample{
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: c.metrics.Block,
+					Tags: rootTS.WithTagsFromMap(map[string]string{
+						"transactions": strconv.Itoa(metric.transactions),
+						"gas_used":     strconv.FormatInt(metric.gasUsed, 10),
+						"gas_limit":    strconv.FormatInt(metric.gasLimit, 10),
+					}),
+				},
+				Value: float64(metric.blockNumber),
+				Time:  metric.timestamp,
+			},
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: c.metrics.GasUsed,
+					Tags:   rootTS,
+				},
+				Value: float64(metric.gasUsed),
+				Time:  metric.timestamp,
+			},
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: c.metrics.TPS,
+					Tags:   rootTS,
+				},
+				Value: metric.tps,
+				Time:  metric.timestamp,
+			},
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: c.metrics.BlockTime,
+					Tags: rootTS.WithTagsFromMap(map[string]string{
+						"block_timestamp_diff": metric.blockTime.String(),
+					}),
+				},
+				Value: float64(metric.blockTime.Milliseconds()),
+				Time:  metric.timestamp,
+			},
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: c.metrics.BaseFee,
+					Tags:   rootTS,
+				},
+				Value: metric.baseFeePercent,
+				Time:  metric.timestamp,
+				Metadata: map[string]string{
+					"block": strconv.FormatInt(metric.blockNumber, 10),
+				},
+			},
+		}...)
+	}
+
+	// Clear pending metrics
+	c.pendingMetrics = c.pendingMetrics[:0]
+
+	// Send all metrics at once
+	metrics.PushIfNotDone(c.vu.Context(), c.vu.State().Samples, metrics.ConnectedSamples{
+		Samples: samples,
+	})
 }

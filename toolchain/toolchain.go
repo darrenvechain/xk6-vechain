@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"math/big"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -23,10 +22,7 @@ import (
 
 // randomPriorityFee returns a random priority fee in range [0, 500]
 func randomPriorityFee() *big.Int {
-	rand.New(rand.NewSource(time.Now().UnixNano()))
-	max := big.NewInt(501)
-	randomValue := new(big.Int).Rand(rand.New(rand.NewSource(time.Now().UnixNano())), max)
-	return randomValue
+	return big.NewInt(int64(random.Intn(501)))
 }
 
 func NewTransaction(thor *thorgo.Thor, managers []*txmanager.PKManager, address common.Address) (string, error) {
